@@ -1,7 +1,13 @@
 """
 Tool: Departamentos disponibles para alquilar (Google Sheets)
 Lee la hoja de cálculo de departamentos en alquiler usando un Service Account
-de Google Cloud (clave JSON). Solo lectura (scope readonly).
+de Google Cloud. Solo lectura (scope readonly).
+
+La credencial del service account se toma preferentemente de la variable de
+entorno GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY (el JSON completo como string), pensada
+para despliegues (Easypanel) donde no se sube el archivo. Si no está definida,
+cae de vuelta a la clave JSON en disco (GOOGLE_SHEETS_CREDENTIALS_FILE) para
+desarrollo local.
 
 Requisitos previos:
 1. Crear un Service Account en Google Cloud y descargar su clave JSON.
@@ -11,6 +17,7 @@ Requisitos previos:
 Autor: Ing. Kevin Inofuente Colque - DataPath
 """
 
+import json
 import os
 
 from dotenv import load_dotenv, find_dotenv
@@ -27,6 +34,8 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # CONFIGURACIÓN DE GOOGLE SHEETS
 # ============================================
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
+# JSON completo del service account como string (preferido para despliegue)
+SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY", "")
 CREDENTIALS_FILE = os.getenv(
     "GOOGLE_SHEETS_CREDENTIALS_FILE", "credentials/google-service-account.json"
 )
@@ -42,17 +51,29 @@ if not SPREADSHEET_ID:
         "Es el ID del Google Sheet (la parte entre /d/ y /edit de la URL)."
     )
 
-if not os.path.exists(CREDENTIALS_FILE):
+# Credencial del service account: dict parseado desde la env var, si existe.
+_SERVICE_ACCOUNT_INFO = None
+if SERVICE_ACCOUNT_KEY.strip():
+    try:
+        _SERVICE_ACCOUNT_INFO = json.loads(SERVICE_ACCOUNT_KEY)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            "❌ GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY no contiene un JSON válido.\n"
+            "Debe ser el contenido completo de la clave del service account "
+            f"(un objeto JSON). Detalle: {e}"
+        )
+elif not os.path.exists(CREDENTIALS_FILE):
     raise ValueError(
-        f"❌ No se encontró la clave JSON del service account: {CREDENTIALS_FILE}\n"
-        "Descárgala desde Google Cloud (IAM > Service Accounts > Keys) y define\n"
-        "GOOGLE_SHEETS_CREDENTIALS_FILE en .env (ruta relativa al proyecto o absoluta)."
+        "❌ No se encontró la credencial del service account de Google Sheets.\n"
+        "Define GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY (JSON completo como string) para\n"
+        "despliegue, o coloca la clave JSON en disco y configura\n"
+        f"GOOGLE_SHEETS_CREDENTIALS_FILE (buscado en: {CREDENTIALS_FILE})."
     )
 
 # Solo lectura: el agente nunca modifica la hoja
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-# Cliente perezoso: la clave se valida al importar, pero la conexión
+# Cliente perezoso: la credencial se valida al importar, pero la conexión
 # a Google se abre recién en la primera consulta.
 _client = None
 
@@ -61,7 +82,12 @@ def _get_worksheet():
     """Devuelve la hoja de trabajo configurada (autentica en la primera llamada)."""
     global _client
     if _client is None:
-        _client = gspread.service_account(filename=CREDENTIALS_FILE, scopes=_SCOPES)
+        if _SERVICE_ACCOUNT_INFO is not None:
+            _client = gspread.service_account_from_dict(
+                _SERVICE_ACCOUNT_INFO, scopes=_SCOPES
+            )
+        else:
+            _client = gspread.service_account(filename=CREDENTIALS_FILE, scopes=_SCOPES)
     spreadsheet = _client.open_by_key(SPREADSHEET_ID)
     if WORKSHEET_NAME:
         return spreadsheet.worksheet(WORKSHEET_NAME)
