@@ -26,6 +26,7 @@ si el cliente lo usa) y decide autónomamente qué herramienta usar en cada turn
 - **RAG** sobre una base de conocimiento propia (Qdrant) — políticas de alquiler, boletos,
   multas y FAQ de Alpha State.
 - **Inventario de inmuebles** en Google Sheets — departamentos disponibles para alquilar.
+- **Pagos mensuales del inquilino** en otro Google Sheet — consulta autenticada (3 factores).
 - **Búsqueda en internet** en tiempo real (Tavily) — datos actuales (ej. índices IGPM/IPCA).
 - **Fecha/hora** por zona horaria (stdlib, sin API).
 - **Memoria persistente** por sesión en PostgreSQL/Supabase.
@@ -57,7 +58,14 @@ Cada requisito tiene un ID y un criterio de aceptación verificable (§10).
   alquilar (disponibilidad, precios, ubicaciones, características) → tool
   `buscar_departamentos_alquiler`, que lee un Google Sheet vía service account (solo lectura)
   y acepta un filtro opcional de texto.
-- **RF-05 (Memoria persistente):** cada conversación se identifica por `session_id` (UUID). El
+- **RF-13 (Pago mensual del inquilino):** preguntas sobre cuánto debe pagar el inquilino
+  (cuota/boleto/gastos comunes del mes vigente) → tool `consultar_pago_inquilino`, que lee
+  un **segundo** Google Sheet (planilla de prorrateo de gastos comunes) vía el **mismo**
+  service account (solo lectura). Autenticación obligatoria de **3 factores** (`id` de 4
+  dígitos + nombre del responsable de pago + bloque inmobiliario): solo si los tres coinciden
+  devuelve el pago; si fallan, no revela nada. Por defecto devuelve el total; con
+  `incluir_detalle=True` agrega el desglose completo. El agente debe **pedir los tres datos**
+  al usuario antes de invocarla (regla en el prompt); nunca inventarlos. cada conversación se identifica por `session_id` (UUID). El
   historial (mensajes user+assistant) se persiste en PostgreSQL y se recarga en cada turno.
 - **RF-06 (Continuidad de sesión):** en CLI, el usuario puede iniciar sesión nueva o continuar
   una existente pegando su UUID. En Chatwoot, el `session_id` se **deriva de forma estable** del
@@ -106,11 +114,12 @@ LangChain-AgenteIA-MultiTool-Qdrant/    # (nombre destino; renombrar carpeta des
 │   ├── __init__.py                  # reexporta API pública del módulo
 │   └── conversation_history.py      # conexión Postgres + crear_tabla + get_session_history
 ├── tools/
-│   ├── __init__.py                  # importa las 3 tools y las lista en __all__
+│   ├── __init__.py                  # importa las 5 tools y las lista en __all__
 │   ├── Base_de_conocimiento.py      # @tool buscar_datapath  (RAG Qdrant — Alpha State)
 │   ├── Busqueda_internet.py         # @tool buscar_internet  (Tavily)
 │   ├── Hora_y_fecha.py              # @tool obtener_fecha_hora (stdlib)
-│   └── google_sheets_departamentos_alquiler.py  # @tool buscar_departamentos_alquiler (Google Sheets)
+│   ├── google_sheets_departamentos_alquiler.py  # @tool buscar_departamentos_alquiler (Google Sheets)
+│   └── google_sheets_pagos_inquilino.py         # @tool consultar_pago_inquilino (Google Sheets, 3 factores)
 ├── rag/
 │   ├── rag.py                       # Script de ingesta a Qdrant (split + embeddings + upsert)
 │   └── data/                        # Fuentes de la base de conocimiento (.md/.txt)
@@ -154,8 +163,8 @@ Si algo que no es ensamblado "va en el orquestador", está mal ubicado.
 - `main() -> None` — CLI interactivo con menú de sesión (nueva / continuar por UUID);
   solo adapta E/S de terminal. Selecciona orquestador con env `AGENT_VERSION`
   (default `1` = `agent.py`; `2` = `agent_v2.py`), ej. `AGENT_VERSION=2 python main.py`.
-- `tools = [buscar_datapath, buscar_internet, obtener_fecha_hora, buscar_departamentos_alquiler]`
-  (orden = registro).
+- `tools = [buscar_datapath, buscar_internet, obtener_fecha_hora, buscar_departamentos_alquiler,
+  consultar_pago_inquilino]` (orden = registro).
 
 ### 5.2 Tools (`langchain_core.tools.@tool`)
 El **docstring de cada tool es su contrato con el modelo** (define cuándo se invoca). Deben
@@ -177,6 +186,17 @@ incluir "Usa esta herramienta cuando…" y, si aplica, "NO uses…".
   como string, vía `service_account_from_dict`) si está definida, o del archivo JSON en disco
   como fallback. Cliente perezoso: la credencial se valida al importar; la conexión se abre
   en la primera consulta.
+- `consultar_pago_inquilino(id_inquilino: str, nombre: str, departamento: str, incluir_detalle: bool = False) -> str`
+  — Google Sheets vía `gspread` con el **mismo** service account (scope `readonly`), pero
+  otro documento (`GOOGLE_PAGOS_SPREADSHEET_ID`). Lee con `get_all_values()` porque la
+  planilla tiene **cabecera de 2 filas** (categorías + detalle): las fusiona en una cabecera
+  efectiva (fila 2, o fila 1 donde la 2 esté vacía) y mapea cada fila de datos a `dict`.
+  Los nombres de columna se resuelven de forma tolerante (sin distinguir mayúsculas/tildes/
+  espacios) contra las constantes `COL_ID="id"`, `COL_NOMBRE`, `COL_DEPARTAMENTO`, `COL_TOTAL`.
+  **Valida 3 factores** (id + nombre + bloque, comparación normalizada); solo si los tres
+  coinciden devuelve el pago. Por defecto muestra el `Total`; con `incluir_detalle=True` añade
+  la lista completa de rubros (omitiendo el `id`, que es secreto y no se re-expone ni se
+  loguea en claro). Cliente perezoso; valida `GOOGLE_PAGOS_SPREADSHEET_ID` al importar.
 
 ### 5.3 Memoria — `conversation_history/`
 - `crear_tabla_historial() -> None` — crea la tabla si no existe (idempotente).
@@ -219,9 +239,10 @@ agent_timezone: America/Lima   # overrideable por env AGENT_TIMEZONE
 Solo `system_prompt` como bloque `|`, estructurado en tags XML según la skill
 `agent-prompt-yaml-format` (`<rol>`, `<contexto_temporal>`, `<herramientas>`,
 `<instrucciones>`, `<reglas>`, `<ejemplos>`). Debe: definir persona (AlphaBot de Alpha
-State), listar las 4 tools y cuándo usar cada una, exigir español (portugués si el cliente
+State), listar las 5 tools y cuándo usar cada una, exigir español (portugués si el cliente
 lo usa), y referir a la FECHA/HORA inyectada en runtime (**no** escribir fecha/hora fija
-aquí). No duplicar contenido de la base de conocimiento.
+aquí). Para `consultar_pago_inquilino` debe exigir pedir los 3 datos (id + nombre + bloque)
+antes de invocarla y no revelar montos sin validar. No duplicar contenido de la base de conocimiento.
 
 ## 8. Variables de entorno (`.env`)
 
@@ -235,7 +256,9 @@ aquí). No duplicar contenido de la base de conocimiento.
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | ✅ | ID del Google Sheet de departamentos (entre `/d/` y `/edit` de la URL) |
 | `GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY` | ➖ (recomendada para despliegue) | JSON **completo** de la clave del service account como string. Si está definida, tiene prioridad sobre el archivo (ideal para Easypanel: sin subir la clave a la imagen) |
 | `GOOGLE_SHEETS_CREDENTIALS_FILE` | ➖ (default `credentials/google-service-account.json`) | Ruta a la clave JSON del service account (relativa al proyecto o absoluta). Solo se usa si **no** hay `GOOGLE_SHEETS_SERVICE_ACCOUNT_KEY` |
-| `GOOGLE_SHEETS_WORKSHEET` | ➖ (default: primera hoja) | Nombre de la pestaña/hoja a leer |
+| `GOOGLE_SHEETS_WORKSHEET` | ➖ (default: primera hoja) | Nombre de la pestaña/hoja a leer (departamentos) |
+| `GOOGLE_PAGOS_SPREADSHEET_ID` | ✅ (para RF-13) | ID del **segundo** Google Sheet, el de pagos mensuales del inquilino. Reutiliza la misma credencial del service account (solo cambia el documento) |
+| `GOOGLE_PAGOS_WORKSHEET` | ➖ (default: primera hoja) | Nombre de la pestaña/hoja a leer del sheet de pagos |
 | `DB_USER`, `DB_PASSWORD`, `DB_HOST` | ✅ | PostgreSQL/Supabase (historial) |
 | `DB_PORT` | ➖ (default `5432`) | Puerto Postgres |
 | `DB_NAME` | ➖ (default `postgres`) | Base de datos |
@@ -255,8 +278,9 @@ Python 3.11+ (por `zoneinfo`). Paquetes clave (ver `requirements.txt`):
 `langchain-postgres`, `psycopg[binary]`, `langchain-tavily` (+`tavily-python`), `gspread`,
 `fastapi`, `uvicorn`, `requests`, `python-dotenv`, `PyYAML`.
 Externos: cuenta OpenAI, instancia **Qdrant** (Easypanel/DigitalOcean, poblada con `rag/rag.py`),
-cuenta **Tavily**, **PostgreSQL/Supabase**, un **Google Sheet** de departamentos compartido con
-el service account (API de Google Sheets habilitada), y (opcional) instancia **Chatwoot**.
+cuenta **Tavily**, **PostgreSQL/Supabase**, **dos Google Sheets** compartidos (Lector) con el
+mismo service account —uno de departamentos y otro de pagos mensuales (con columna `id` de 4
+dígitos)— con la API de Google Sheets habilitada, y (opcional) instancia **Chatwoot**.
 
 ## 10. Procedimiento de replicación desde cero
 
@@ -265,7 +289,7 @@ el service account (API de Google Sheets habilitada), y (opcional) instancia **C
 3. **Secretos:** crear `.env` con las variables de §8.
 4. **Config:** escribir `model_config/model_config.yaml` y `prompt/prompt.yaml` (§7).
 5. **Memoria:** implementar `conversation_history/` (§5.3) con validación de env y `quote_plus`.
-6. **Tools:** implementar las 4 tools (§5.2), cada una con docstring rica, carga de env y manejo de errores; registrarlas en `tools/__init__.py`.
+6. **Tools:** implementar las 5 tools (§5.2), cada una con docstring rica, carga de env y manejo de errores; registrarlas en `tools/__init__.py`.
 7. **Orquestador:** implementar `agent.py` (§5.1, §5.4): carga YAML, `bind_tools`, `chat_con_agente`, inyección de fecha/hora por turno.
 8. **Canales:** implementar `main.py` (CLI, §5.1b) y `main_chatwoot.py` (§5.5), ambos reusando `chat_con_agente`.
 9. **Datos (ingesta):** colocar las fuentes de la base de conocimiento en `rag/data/` y ejecutar `python rag/rag.py` (o `--reset` para vaciar el índice primero). Los embeddings deben ser `text-embedding-ada-002` (mismo modelo que la tool RAG).
@@ -285,3 +309,7 @@ el service account (API de Google Sheets habilitada), y (opcional) instancia **C
 - **CA-09:** mensaje con "quiero hablar con un humano" → reetiqueta `atiende-humano` y no llama al agente (RF-08).
 - **CA-10:** faltando una env obligatoria (DB/Qdrant/Tavily/Google Sheets), el proceso falla al importar con `ValueError` claro (RNF-03).
 - **CA-11:** "¿Qué departamentos tienen para alquilar?" invoca `buscar_departamentos_alquiler` y responde con los datos del Google Sheet (RF-12).
+- **CA-12:** "¿Cuánto debo pagar este mes?" hace que el agente **pida** id + nombre + bloque;
+  al darlos correctos, invoca `consultar_pago_inquilino` y devuelve el total (y el desglose si
+  se pide `incluir_detalle`); con datos incorrectos responde "No fue posible validar tu
+  identidad" sin revelar montos (RF-13).
