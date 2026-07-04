@@ -1,0 +1,37 @@
+# Secretos y variables de entorno (inyectar en runtime, NO en la imagen)
+.env
+.env.*
+!.env.example
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Git y metadatos
+.git/
+.gitignore
+.dockerignore
+
+# Editores / IDE
+.vscode/
+.idea/
+
+# Herramientas de Claude
+.claude/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Notebooks
+*.ipynb
