@@ -1,0 +1,36 @@
+# Variables de entorno y secretos
+.env
+.env.*
+!.env.example
+
+# Credenciales (service account, claves)
+credentials/
+*.json
+!.vscode/*.json
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editores / IDE
+.vscode/
+.idea/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
